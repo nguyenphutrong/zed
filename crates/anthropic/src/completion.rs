@@ -3,9 +3,9 @@ use collections::HashMap;
 use futures::{Stream, StreamExt};
 use language_model_core::{
     CompactionContent, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelProviderName, LanguageModelRequest, LanguageModelToolChoice,
-    LanguageModelToolResultContent, LanguageModelToolUse, MessageContent, Role, StopReason,
-    TokenUsage,
+    LanguageModelProviderName, LanguageModelRequest, LanguageModelRequestToolInput,
+    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolUse,
+    LanguageModelToolUseInput, MessageContent, Role, StopReason, TokenUsage,
     util::{fix_streamed_json, parse_tool_arguments},
 };
 use std::pin::Pin;
@@ -68,7 +68,7 @@ fn mark_last_cacheable_content(content: &mut [RequestContent], cache_control: Ca
     }
 }
 
-fn to_anthropic_content(content: MessageContent) -> Option<RequestContent> {
+fn to_anthropic_content(content: MessageContent) -> Result<Option<RequestContent>> {
     match content {
         MessageContent::Text(text) => {
             let text = if text.chars().last().is_some_and(|c| c.is_whitespace()) {
@@ -77,12 +77,12 @@ fn to_anthropic_content(content: MessageContent) -> Option<RequestContent> {
                 text
             };
             if !text.is_empty() {
-                Some(RequestContent::Text {
+                Ok(Some(RequestContent::Text {
                     text,
                     cache_control: None,
-                })
+                }))
             } else {
-                None
+                Ok(None)
             }
         }
         MessageContent::Thinking {
@@ -92,36 +92,41 @@ fn to_anthropic_content(content: MessageContent) -> Option<RequestContent> {
             if let Some(signature) = signature
                 && !thinking.is_empty()
             {
-                Some(RequestContent::Thinking {
+                Ok(Some(RequestContent::Thinking {
                     thinking,
                     signature,
                     cache_control: None,
-                })
+                }))
             } else {
-                None
+                Ok(None)
             }
         }
         MessageContent::RedactedThinking(data) => {
             if !data.is_empty() {
-                Some(RequestContent::RedactedThinking { data })
+                Ok(Some(RequestContent::RedactedThinking { data }))
             } else {
-                None
+                Ok(None)
             }
         }
-        MessageContent::Image(image) => Some(RequestContent::Image {
+        MessageContent::Image(image) => Ok(Some(RequestContent::Image {
             source: ImageSource {
                 source_type: "base64".to_string(),
                 media_type: "image/png".to_string(),
                 data: image.source.to_string(),
             },
             cache_control: None,
-        }),
-        MessageContent::ToolUse(tool_use) => Some(RequestContent::ToolUse {
-            id: tool_use.id.to_string(),
-            name: tool_use.name.to_string(),
-            input: tool_use.input,
-            cache_control: None,
-        }),
+        })),
+        MessageContent::ToolUse(tool_use) => match tool_use.input {
+            LanguageModelToolUseInput::Json(input) => Ok(Some(RequestContent::ToolUse {
+                id: tool_use.id.to_string(),
+                name: tool_use.name.to_string(),
+                input,
+                cache_control: None,
+            })),
+            LanguageModelToolUseInput::Text(_) => Err(anyhow::anyhow!(
+                "Anthropic does not support custom tool calls"
+            )),
+        },
         MessageContent::ToolResult(tool_result) => {
             let content = match tool_result.content.as_slice() {
                 [LanguageModelToolResultContent::Text(text)] => {
@@ -147,24 +152,24 @@ fn to_anthropic_content(content: MessageContent) -> Option<RequestContent> {
                     ToolResultContent::Multipart(parts)
                 }
             };
-            Some(RequestContent::ToolResult {
+            Ok(Some(RequestContent::ToolResult {
                 tool_use_id: tool_result.tool_use_id.to_string(),
                 is_error: tool_result.is_error,
                 content,
                 cache_control: None,
-            })
+            }))
         }
         MessageContent::Compaction(CompactionContent::Summary { content }) => {
-            Some(RequestContent::Compaction {
+            Ok(Some(RequestContent::Compaction {
                 content,
                 cache_control: None,
-            })
+            }))
         }
         // Encrypted compaction blocks come from other providers, and a
         // Pending block is a streaming-only UI signal; neither is replayed.
         MessageContent::Compaction(
             CompactionContent::Encrypted { .. } | CompactionContent::Pending,
-        ) => None,
+        ) => Ok(None),
     }
 }
 
@@ -175,7 +180,7 @@ pub fn into_anthropic(
     max_output_tokens: u64,
     mode: AnthropicModelMode,
     cache_mode: AnthropicPromptCacheMode,
-) -> crate::Request {
+) -> Result<crate::Request> {
     let mut new_messages: Vec<Message> = Vec::new();
     let mut system_message = String::new();
     let mut any_message_wants_cache = false;
@@ -189,11 +194,12 @@ pub fn into_anthropic(
 
         match message.role {
             Role::User | Role::Assistant => {
-                let mut anthropic_message_content: Vec<RequestContent> = message
-                    .content
-                    .into_iter()
-                    .filter_map(to_anthropic_content)
-                    .collect();
+                let mut anthropic_message_content = Vec::new();
+                for content in message.content {
+                    if let Some(content) = to_anthropic_content(content)? {
+                        anthropic_message_content.push(content);
+                    }
+                }
                 let anthropic_role = match message.role {
                     Role::User => crate::Role::User,
                     Role::Assistant => crate::Role::Assistant,
@@ -261,21 +267,52 @@ pub fn into_anthropic(
     let mut tools: Vec<Tool> = request
         .tools
         .into_iter()
-        .map(|tool| Tool {
-            name: tool.name,
-            description: tool.description,
-            input_schema: tool.input_schema,
-            eager_input_streaming: tool.use_input_streaming,
-            cache_control: None,
+        .map(|tool| match tool.input {
+            LanguageModelRequestToolInput::Function {
+                input_schema,
+                use_input_streaming,
+            } => Ok(Tool {
+                name: tool.name,
+                description: tool.description,
+                input_schema,
+                eager_input_streaming: use_input_streaming,
+                cache_control: None,
+            }),
+            LanguageModelRequestToolInput::Custom { .. } => {
+                Err(anyhow::anyhow!("Anthropic does not support custom tools"))
+            }
         })
-        .collect();
+        .collect::<Result<_>>()?;
     if let Some(cache_control) = long_lived_cache
         && let Some(last_tool) = tools.last_mut()
     {
         last_tool.cache_control = Some(cache_control);
     }
 
-    crate::Request {
+    let thinking = if request.thinking_allowed {
+        match mode {
+            AnthropicModelMode::Thinking { budget_tokens } => {
+                Some(Thinking::Enabled { budget_tokens })
+            }
+            AnthropicModelMode::AdaptiveThinking => Some(Thinking::Adaptive {
+                display: Some(AdaptiveThinkingDisplay::Summarized),
+            }),
+            AnthropicModelMode::Default => None,
+        }
+    } else if crate::requires_explicit_thinking_opt_out(&model) {
+        // On Claude Opus 5, omitting the `thinking` field no longer means
+        // "off": the model runs adaptive thinking by default, so features
+        // that suppress thinking (e.g. inline assist) must opt out
+        // explicitly. `disabled` is only accepted at effort `high` or below;
+        // that holds here because `output_config` is never sent when thinking
+        // is disallowed, and the server-side default effort is `high`.
+        // <https://platform.claude.com/docs/en/about-claude/models/migration-guide#migrating-to-claude-opus-5>
+        Some(Thinking::Disabled)
+    } else {
+        None
+    };
+
+    Ok(crate::Request {
         model,
         messages: new_messages,
         max_tokens: max_output_tokens,
@@ -290,19 +327,7 @@ pub fn into_anthropic(
                 cache_type: CacheControlType::Ephemeral,
                 ttl: None,
             }),
-        thinking: if request.thinking_allowed {
-            match mode {
-                AnthropicModelMode::Thinking { budget_tokens } => {
-                    Some(Thinking::Enabled { budget_tokens })
-                }
-                AnthropicModelMode::AdaptiveThinking => Some(Thinking::Adaptive {
-                    display: Some(AdaptiveThinkingDisplay::Summarized),
-                }),
-                AnthropicModelMode::Default => None,
-            }
-        } else {
-            None
-        },
+        thinking,
         tools,
         tool_choice: request.tool_choice.map(|choice| match choice {
             LanguageModelToolChoice::Auto => ToolChoice::Auto,
@@ -339,7 +364,7 @@ pub fn into_anthropic(
                 trigger: Some(CompactionTrigger::InputTokens { value }),
             }],
         }),
-    }
+    })
 }
 
 pub struct AnthropicEventMapper {
@@ -451,7 +476,7 @@ impl AnthropicEventMapper {
                                     name: tool_use.name.clone().into(),
                                     is_input_complete: false,
                                     raw_input: tool_use.input_json.clone(),
-                                    input,
+                                    input: LanguageModelToolUseInput::Json(input),
                                     thought_signature: None,
                                 },
                             ))];
@@ -469,7 +494,7 @@ impl AnthropicEventMapper {
                                 id: tool_use.id.into(),
                                 name: tool_use.name.into(),
                                 is_input_complete: true,
-                                input,
+                                input: LanguageModelToolUseInput::Json(input),
                                 raw_input: tool_use.input_json.clone(),
                                 thought_signature: None,
                             },
@@ -597,12 +622,12 @@ mod tests {
             intent: None,
             stop: vec![],
             temperature: None,
-            tools: vec![language_model_core::LanguageModelRequestTool {
-                name: "do_thing".into(),
-                description: "Does a thing.".into(),
-                input_schema: serde_json::json!({"type": "object"}),
-                use_input_streaming: false,
-            }],
+            tools: vec![language_model_core::LanguageModelRequestTool::function(
+                "do_thing".into(),
+                "Does a thing.".into(),
+                serde_json::json!({"type": "object"}),
+                false,
+            )],
             tool_choice: None,
             thinking_allowed: true,
             thinking_effort: None,
@@ -617,7 +642,8 @@ mod tests {
             4096,
             AnthropicModelMode::Default,
             AnthropicPromptCacheMode::Automatic,
-        );
+        )
+        .unwrap();
 
         // No message content block should carry cache_control anymore; the
         // conversation breakpoint is set via top-level automatic caching.
@@ -703,12 +729,12 @@ mod tests {
             intent: None,
             stop: vec![],
             temperature: None,
-            tools: vec![language_model_core::LanguageModelRequestTool {
-                name: "do_thing".into(),
-                description: "Does a thing.".into(),
-                input_schema: serde_json::json!({"type": "object"}),
-                use_input_streaming: false,
-            }],
+            tools: vec![language_model_core::LanguageModelRequestTool::function(
+                "do_thing".into(),
+                "Does a thing.".into(),
+                serde_json::json!({"type": "object"}),
+                false,
+            )],
             tool_choice: None,
             thinking_allowed: true,
             thinking_effort: None,
@@ -723,7 +749,8 @@ mod tests {
             4096,
             AnthropicModelMode::Default,
             AnthropicPromptCacheMode::Legacy,
-        );
+        )
+        .unwrap();
 
         assert!(anthropic_request.cache_control.is_none());
         assert!(matches!(
@@ -781,7 +808,8 @@ mod tests {
             128_000,
             AnthropicModelMode::AdaptiveThinking,
             AnthropicPromptCacheMode::Automatic,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             anthropic_request
@@ -789,6 +817,68 @@ mod tests {
                 .and_then(|config| config.effort),
             Some(crate::Effort::XHigh)
         );
+    }
+
+    #[test]
+    fn test_thinking_disallowed_sends_explicit_opt_out_only_where_required() {
+        // (model, expects_explicit_opt_out): Claude Opus 5 thinks by default
+        // when the `thinking` field is omitted, so suppressing thinking
+        // requires sending `{"type": "disabled"}`. Earlier Opus models treat
+        // omission as "off", and Fable rejects `disabled` outright, so both
+        // must keep omitting the field.
+        for (model, expects_explicit_opt_out) in [
+            ("claude-opus-5", true),
+            ("claude-opus-4-8", false),
+            ("claude-fable-5", false),
+        ] {
+            let request = LanguageModelRequest {
+                messages: vec![LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("Hi".to_string())],
+                    cache: false,
+                    reasoning_details: None,
+                }],
+                thread_id: None,
+                prompt_id: None,
+                intent: None,
+                stop: vec![],
+                temperature: None,
+                tools: vec![],
+                tool_choice: None,
+                thinking_allowed: false,
+                thinking_effort: None,
+                speed: None,
+                compact_at_tokens: None,
+            };
+
+            let anthropic_request = into_anthropic(
+                request,
+                model.to_string(),
+                1.0,
+                128_000,
+                AnthropicModelMode::AdaptiveThinking,
+                AnthropicPromptCacheMode::Automatic,
+            )
+            .unwrap();
+
+            if expects_explicit_opt_out {
+                assert!(
+                    matches!(anthropic_request.thinking, Some(Thinking::Disabled)),
+                    "{model} should send an explicit thinking opt-out"
+                );
+                // `disabled` combined with effort `xhigh`/`max` is a 400, so
+                // no effort may accompany the opt-out.
+                assert!(
+                    anthropic_request.output_config.is_none(),
+                    "{model} must not send output_config with thinking disabled"
+                );
+            } else {
+                assert!(
+                    anthropic_request.thinking.is_none(),
+                    "{model} should omit the thinking field entirely"
+                );
+            }
+        }
     }
 
     #[test]
@@ -813,12 +903,12 @@ mod tests {
             intent: None,
             stop: vec![],
             temperature: None,
-            tools: vec![language_model_core::LanguageModelRequestTool {
-                name: "do_thing".into(),
-                description: "Does a thing.".into(),
-                input_schema: serde_json::json!({"type": "object"}),
-                use_input_streaming: false,
-            }],
+            tools: vec![language_model_core::LanguageModelRequestTool::function(
+                "do_thing".into(),
+                "Does a thing.".into(),
+                serde_json::json!({"type": "object"}),
+                false,
+            )],
             tool_choice: None,
             thinking_allowed: true,
             thinking_effort: None,
@@ -833,7 +923,8 @@ mod tests {
             4096,
             AnthropicModelMode::Default,
             AnthropicPromptCacheMode::Automatic,
-        );
+        )
+        .unwrap();
 
         assert!(anthropic_request.cache_control.is_none());
         assert!(matches!(
@@ -879,6 +970,7 @@ mod tests {
             },
             AnthropicPromptCacheMode::Automatic,
         )
+        .unwrap()
     }
 
     #[test]
@@ -977,7 +1069,8 @@ mod tests {
             4096,
             AnthropicModelMode::Default,
             AnthropicPromptCacheMode::Disabled,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             serde_json::to_value(&anthropic_request.context_management).unwrap(),

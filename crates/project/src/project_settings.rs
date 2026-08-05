@@ -133,6 +133,10 @@ pub struct GlobalLspSettings {
     ///
     /// Default: `120`
     pub request_timeout: u64,
+    /// The maximum line length a buffer may contain before language server features are disabled for the entire buffer.
+    ///
+    /// Default: `20000`
+    pub max_buffer_line_length: u32,
     pub notifications: LspNotificationSettings,
 
     /// Rules for highlighting semantic tokens.
@@ -144,6 +148,7 @@ impl Default for GlobalLspSettings {
         Self {
             button: true,
             request_timeout: DEFAULT_LSP_REQUEST_TIMEOUT_SECS,
+            max_buffer_line_length: 20_000,
             notifications: LspNotificationSettings::default(),
             semantic_token_rules: SemanticTokenRules::default(),
         }
@@ -540,6 +545,22 @@ impl From<settings::GitPathStyle> for GitPathStyle {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InlineBlameLocation {
+    #[default]
+    Inline,
+    StatusBar,
+}
+
+impl From<settings::InlineBlameLocation> for InlineBlameLocation {
+    fn from(location: settings::InlineBlameLocation) -> Self {
+        match location {
+            settings::InlineBlameLocation::Inline => InlineBlameLocation::Inline,
+            settings::InlineBlameLocation::StatusBar => InlineBlameLocation::StatusBar,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct InlineBlameSettings {
     /// Whether or not to show git blame data inline in
@@ -552,6 +573,10 @@ pub struct InlineBlameSettings {
     ///
     /// Default: 0
     pub delay_ms: settings::DelayMs,
+    /// Where to render the blame information when enabled.
+    ///
+    /// Default: inline
+    pub location: InlineBlameLocation,
     /// The amount of padding between the end of the source line and the start
     /// of the inline blame in units of columns.
     ///
@@ -680,6 +705,7 @@ impl Settings for ProjectSettings {
                 InlineBlameSettings {
                     enabled: inline.enabled.unwrap(),
                     delay_ms: inline.delay_ms.unwrap(),
+                    location: inline.location.unwrap().into(),
                     padding: inline.padding.unwrap(),
                     min_column: inline.min_column.unwrap(),
                     show_commit_summary: inline.show_commit_summary.unwrap(),
@@ -745,6 +771,12 @@ impl Settings for ProjectSettings {
                     .as_ref()
                     .unwrap()
                     .request_timeout
+                    .unwrap(),
+                max_buffer_line_length: content
+                    .global_lsp_settings
+                    .as_ref()
+                    .unwrap()
+                    .max_buffer_line_length
                     .unwrap(),
                 notifications: LspNotificationSettings {
                     dismiss_timeout_ms: content
@@ -1139,7 +1171,7 @@ impl SettingsObserver {
                     .send(proto::UpdateWorktreeSettings {
                         project_id,
                         worktree_id,
-                        path: path.to_proto(),
+                        path: path.as_unix_str().to_owned(),
                         content: Some(content),
                         kind: Some(
                             local_settings_kind_to_proto(LocalSettingsKind::Settings).into(),
@@ -1322,7 +1354,7 @@ impl SettingsObserver {
                     .unwrap()
                     .into();
                 (settings_dir, LocalSettingsKind::Debug)
-            } else if path.ends_with(RelPath::unix(EDITORCONFIG_NAME).unwrap()) {
+            } else if path.ends_with(RelPath::from_unix_str(EDITORCONFIG_NAME).unwrap()) {
                 let Some(settings_dir) = path.parent().map(Arc::from) else {
                     continue;
                 };

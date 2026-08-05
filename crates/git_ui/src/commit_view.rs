@@ -2,8 +2,8 @@ use anyhow::{Context as _, Result};
 use buffer_diff::{BufferDiff, BufferDiffSnapshot};
 use collections::HashMap;
 use editor::{
-    Addon, Editor, EditorEvent, EditorSettings, GitBlameOverride, MultiBuffer, SplittableEditor,
-    hover_markdown_style, multibuffer_context_lines,
+    Addon, Editor, EditorEvent, EditorSettings, GitBlameOverride, MultiBuffer,
+    RestoreOnlyDiffHunkDelegate, SplittableEditor, hover_markdown_style, multibuffer_context_lines,
 };
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, CommitDiff, RepoPath, is_binary_content};
@@ -347,7 +347,7 @@ impl CommitView {
                 window,
                 cx,
             );
-            editor.disable_diff_hunk_controls(cx);
+            editor.set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyDiffHunkDelegate)), cx);
 
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_show_bookmarks(false, cx);
@@ -878,13 +878,7 @@ impl CommitView {
                                         .overflow_y_scroll()
                                         .track_scroll(&self.message_scroll_handle)
                                 })
-                                .child(
-                                    MarkdownElement::new(self.message.clone(), markdown_style)
-                                        .on_url_click(|url, _, cx| {
-                                            cx.stop_propagation();
-                                            cx.open_url(&url);
-                                        }),
-                                ),
+                                .child(MarkdownElement::new(self.message.clone(), markdown_style)),
                         )
                         .vertical_scrollbar_for(&self.message_scroll_handle, window, cx),
                 ),
@@ -1141,23 +1135,9 @@ async fn build_buffer_diff(
 
     let language = cx.update(|_, cx| buffer.read(cx).language().cloned())?;
     let buffer = cx.update(|_, cx| buffer.read(cx).snapshot())?;
-    let base_text = old_text.as_deref().unwrap_or_default();
-    let base_text = Rope::from(base_text);
-    let base_text_buffer = cx.new(|cx| {
-        let text_buffer = TextBuffer::new_normalized(
-            ReplicaId::LOCAL,
-            cx.entity_id().as_non_zero_u64().into(),
-            buffer.text.line_ending(),
-            base_text,
-        );
-        let mut buffer = Buffer::build(text_buffer, buffer.file().cloned(), Capability::ReadOnly);
-        buffer.set_language_registry(language_registry.clone());
-        buffer.set_language_async(language.clone(), cx);
-        buffer
-    });
 
     let diff =
-        cx.new(|cx| BufferDiff::new_with_base_text_buffer(&buffer.text, base_text_buffer, cx));
+        cx.new(|cx| BufferDiff::new(&buffer.text, language, Some(language_registry.clone()), cx));
 
     diff.update(cx, |diff, cx| {
         diff.set_base_text(
@@ -1169,71 +1149,6 @@ async fn build_buffer_diff(
     .await;
 
     Ok(diff)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn synthetic_blame_row_ranges(
-        base_text: &str,
-        current_text: &str,
-        cx: &mut gpui::TestAppContext,
-    ) -> (Vec<Range<u32>>, Vec<Range<u32>>) {
-        cx.update(|cx| {
-            let buffer = cx.new(|cx| Buffer::local(current_text.to_string(), cx));
-            let diff = cx.new(|cx| {
-                BufferDiff::new_with_base_text(base_text, &buffer.read(cx).text_snapshot(), cx)
-            });
-            let buffer_snapshot = buffer.read(cx).snapshot();
-            let base_text_buffer = diff.read(cx).base_text_buffer().clone();
-            let base_text_buffer_snapshot = base_text_buffer.read(cx).snapshot();
-            let diff_snapshot = diff.read(cx).snapshot(cx);
-            let entries_by_buffer = synthetic_blame_entries_for_commit_diff(
-                buffer_snapshot.remote_id(),
-                &buffer_snapshot,
-                &base_text_buffer_snapshot,
-                &diff_snapshot,
-                "9999999999999999999999999999999999999999".parse().unwrap(),
-                "Author",
-                "<author@example.com>",
-                1,
-                Some("Commit summary"),
-            );
-
-            let row_ranges_for_buffer = |buffer_id| {
-                entries_by_buffer
-                    .get(&buffer_id)
-                    .map(|entries| {
-                        entries
-                            .iter()
-                            .map(|entry| entry.range.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            };
-
-            (
-                row_ranges_for_buffer(buffer_snapshot.remote_id()),
-                row_ranges_for_buffer(base_text_buffer_snapshot.remote_id()),
-            )
-        })
-    }
-
-    #[gpui::test]
-    fn test_synthetic_blame_entries_for_commit_diff_hunks(cx: &mut gpui::TestAppContext) {
-        let (rhs_ranges, lhs_ranges) = synthetic_blame_row_ranges("a\nc\n", "a\nb\nc\n", cx);
-        assert_eq!(rhs_ranges, vec![1..2]);
-        assert!(lhs_ranges.is_empty());
-
-        let (rhs_ranges, lhs_ranges) = synthetic_blame_row_ranges("a\nb\nc\n", "a\nB\nc\n", cx);
-        assert_eq!(rhs_ranges, vec![1..2]);
-        assert_eq!(lhs_ranges, vec![1..2]);
-
-        let (rhs_ranges, lhs_ranges) = synthetic_blame_row_ranges("a\nb\nc\n", "a\nc\n", cx);
-        assert!(rhs_ranges.is_empty());
-        assert_eq!(lhs_ranges, vec![1..2]);
-    }
 }
 
 impl EventEmitter<EditorEvent> for CommitView {}
@@ -1410,7 +1325,7 @@ impl Item for CommitView {
                         window,
                         cx,
                     );
-                    editor.disable_diff_hunk_controls(cx);
+                    editor.set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyDiffHunkDelegate)), cx);
                     editor.rhs_editor().update(cx, |editor, cx| {
                         editor.set_show_bookmarks(false, cx);
                         editor.set_show_breakpoints(false, cx);
@@ -1602,4 +1517,68 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
         .get(stash_index)
         .map(|entry| entry.oid.to_string() == sha)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_blame_row_ranges(
+        base_text: &str,
+        current_text: &str,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Vec<Range<u32>>, Vec<Range<u32>>) {
+        let buffer = cx.new(|cx| Buffer::local(current_text, cx));
+        let buffer_snapshot = cx.update(|cx| buffer.read(cx).snapshot());
+        let diff = cx.new(|cx| BufferDiff::new_with_base_text(base_text, &buffer_snapshot, cx));
+        cx.run_until_parked();
+
+        let (base_text_buffer_snapshot, entries_by_buffer) = cx.update(|cx| {
+            let base_text_buffer = diff.read(cx).base_text_buffer().clone();
+            let base_text_buffer_snapshot = base_text_buffer.read(cx).snapshot();
+            let diff_snapshot = diff.read(cx).snapshot(cx);
+            let entries_by_buffer = synthetic_blame_entries_for_commit_diff(
+                buffer_snapshot.remote_id(),
+                &buffer_snapshot,
+                &base_text_buffer_snapshot,
+                &diff_snapshot,
+                "0123456789012345678901234567890123456789"
+                    .parse()
+                    .expect("valid test oid"),
+                "Test Author",
+                "<test@example.com>",
+                0,
+                Some("Test commit"),
+            );
+            (base_text_buffer_snapshot, entries_by_buffer)
+        });
+        let rhs_ranges = entries_by_buffer
+            .get(&buffer_snapshot.remote_id())
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.range.clone())
+            .collect();
+        let lhs_ranges = entries_by_buffer
+            .get(&base_text_buffer_snapshot.remote_id())
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.range.clone())
+            .collect();
+        (rhs_ranges, lhs_ranges)
+    }
+
+    #[gpui::test]
+    fn test_synthetic_blame_entries_for_commit_diff_hunks(cx: &mut gpui::TestAppContext) {
+        let (rhs_ranges, lhs_ranges) = synthetic_blame_row_ranges("a\nc\n", "a\nb\nc\n", cx);
+        assert_eq!(rhs_ranges, vec![1..2]);
+        assert!(lhs_ranges.is_empty());
+
+        let (rhs_ranges, lhs_ranges) = synthetic_blame_row_ranges("a\nb\nc\n", "a\nB\nc\n", cx);
+        assert_eq!(rhs_ranges, vec![1..2]);
+        assert_eq!(lhs_ranges, vec![1..2]);
+
+        let (rhs_ranges, lhs_ranges) = synthetic_blame_row_ranges("a\nb\nc\n", "a\nc\n", cx);
+        assert!(rhs_ranges.is_empty());
+        assert_eq!(lhs_ranges, vec![1..2]);
+    }
 }
