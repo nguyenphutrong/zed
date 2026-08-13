@@ -3,8 +3,7 @@ use client::Client;
 use db::kvp::KeyValueStore;
 use futures_lite::StreamExt;
 use gpui::{
-    App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, Global, Task, TaskExt,
-    Window, actions,
+    App, AppContext as _, AsyncApp, Context, Entity, Global, Task, TaskExt, Window, actions,
 };
 use http_client::{HttpClient, HttpClientWithUrl};
 use paths::remote_servers_dir;
@@ -17,7 +16,6 @@ use smol::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
 };
-use std::mem;
 use std::{
     env::{
         self,
@@ -184,6 +182,7 @@ pub struct AutoUpdater {
     quit_subscription: Option<gpui::Subscription>,
     update_check_type: UpdateCheckType,
     dismissed_status: Option<AutoUpdateStatus>,
+    failed_install_version: Option<Version>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -202,58 +201,6 @@ struct GithubRelease {
 struct GithubReleaseAsset {
     name: String,
     browser_download_url: String,
-}
-
-struct MacOsUnmounter<'a> {
-    mount_path: PathBuf,
-    background_executor: &'a BackgroundExecutor,
-}
-
-impl MacOsUnmounter<'_> {
-    /// Unmounts the disk image and waits for completion. This must happen
-    /// before the `InstallerDir` is dropped: deleting the temp dir while the
-    /// image is still mounted inside it fails silently and leaks the
-    /// directory (and the downloaded DMG) in the system temp dir.
-    async fn unmount(mut self) {
-        let mount_path = mem::take(&mut self.mount_path);
-        unmount_disk_image(&mount_path).await;
-    }
-}
-
-impl Drop for MacOsUnmounter<'_> {
-    fn drop(&mut self) {
-        let mount_path = mem::take(&mut self.mount_path);
-        // Safety net for early exits and cancellation; the happy path calls
-        // `unmount`, which leaves the path empty.
-        if mount_path.as_os_str().is_empty() {
-            return;
-        }
-        self.background_executor
-            .spawn(async move { unmount_disk_image(&mount_path).await })
-            .detach();
-    }
-}
-
-async fn unmount_disk_image(mount_path: &Path) {
-    let unmount_output = new_command("hdiutil")
-        .args(["detach", "-force"])
-        .arg(mount_path)
-        .output()
-        .await;
-    match unmount_output {
-        Ok(output) if output.status.success() => {
-            log::info!("Successfully unmounted the disk image");
-        }
-        Ok(output) => {
-            log::error!(
-                "Failed to unmount disk image: {:?}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Err(error) => {
-            log::error!("Error while trying to unmount disk image: {:?}", error);
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, RegisterSetting)]
@@ -375,24 +322,69 @@ pub fn view_release_notes(_: &ViewReleaseNotes, cx: &mut App) -> Option<()> {
     None
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+const INSTALLER_DIR_PREFIX: &str = "rezed-auto-update";
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 const INSTALLER_DIR_PREFIX: &str = "zed-auto-update";
+#[cfg(target_os = "macos")]
+const INSTALLER_MARKER_FILE: &str = ".rezed-auto-update";
+#[cfg(target_os = "macos")]
+const INSTALLER_MARKER_PREFIX: &str = "nguyenphutrong/rezed auto updater pid=";
+
+#[cfg(target_os = "macos")]
+const LEGACY_INSTALLER_DIR_PREFIX: &str = "zed-auto-update";
+#[cfg(target_os = "macos")]
+const UPDATE_LOCK_FILE: &str = "rezed-auto-update.lock";
 
 #[cfg(not(target_os = "windows"))]
-struct InstallerDir(tempfile::TempDir);
+struct InstallerDir {
+    path: PathBuf,
+    temp_dir: Option<tempfile::TempDir>,
+}
 
 #[cfg(not(target_os = "windows"))]
 impl InstallerDir {
     async fn new() -> Result<Self> {
-        Ok(Self(
-            tempfile::Builder::new()
-                .prefix(INSTALLER_DIR_PREFIX)
-                .tempdir()?,
-        ))
+        let temp_dir = tempfile::Builder::new()
+            .prefix(INSTALLER_DIR_PREFIX)
+            .tempdir()?;
+        let path = temp_dir.path().to_owned();
+        #[cfg(target_os = "macos")]
+        fs::write(
+            path.join(INSTALLER_MARKER_FILE),
+            installer_marker_content(std::process::id()),
+        )
+        .await?;
+        Ok(Self {
+            path,
+            temp_dir: Some(temp_dir),
+        })
     }
 
     fn path(&self) -> &Path {
-        self.0.path()
+        &self.path
+    }
+
+    fn keep_for_external_cleanup(&mut self) {
+        if let Some(temp_dir) = self.temp_dir.take() {
+            drop(temp_dir.keep());
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Drop for InstallerDir {
+    fn drop(&mut self) {
+        let Some(temp_dir) = self.temp_dir.take() else {
+            return;
+        };
+        let path = temp_dir.path().to_owned();
+        if let Err(error) = temp_dir.close() {
+            log::error!(
+                "failed to remove auto-update installer dir {}: {error}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -416,6 +408,8 @@ impl InstallerDir {
     fn path(&self) -> &Path {
         self.0.as_path()
     }
+
+    fn keep_for_external_cleanup(&mut self) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -461,6 +455,7 @@ impl AutoUpdater {
             quit_subscription,
             update_check_type: UpdateCheckType::Automatic,
             dismissed_status: None,
+            failed_install_version: None,
         }
     }
 
@@ -481,7 +476,12 @@ impl AutoUpdater {
                     .log_err();
             }
 
-            #[cfg(all(not(target_os = "windows"), not(test)))]
+            #[cfg(all(target_os = "macos", not(test)))]
+            while !cx.background_spawn(cleanup_stale_installer_dirs()).await {
+                cx.background_executor().timer(poll_interval).await;
+            }
+
+            #[cfg(all(not(target_os = "macos"), not(target_os = "windows"), not(test)))]
             cx.background_spawn(cleanup_stale_installer_dirs()).detach();
 
             loop {
@@ -517,7 +517,7 @@ impl AutoUpdater {
                 if let Err(error) = result {
                     let is_missing_dependency =
                         error.downcast_ref::<MissingDependencyError>().is_some();
-                    this.status = match check_type {
+                    this.status = match this.update_check_type {
                         UpdateCheckType::Automatic if is_missing_dependency => {
                             log::warn!("auto-update: {}", error);
                             AutoUpdateStatus::Errored {
@@ -792,6 +792,9 @@ impl AutoUpdater {
     }
 
     async fn update(this: Entity<Self>, cx: &mut AsyncApp) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        let _update_lock = acquire_macos_update_lock()?;
+
         let (client, installed_version, previous_status, release_channel) =
             this.read_with(cx, |this, cx| {
                 (
@@ -832,6 +835,19 @@ impl AutoUpdater {
             });
             return Ok(());
         };
+
+        if this.read_with(cx, |this, _| {
+            this.should_skip_automatic_install_retry(&newer_version)
+        }) {
+            log::warn!(
+                "skipping automatic retry of Rezed {newer_version} after its installation failed"
+            );
+            this.update(cx, |this, cx| {
+                this.status = AutoUpdateStatus::Idle;
+                cx.notify();
+            });
+            return Ok(());
+        }
 
         this.update(cx, |this, cx| {
             this.status = AutoUpdateStatus::Downloading {
@@ -885,25 +901,38 @@ impl AutoUpdater {
 
         #[cfg(not(test))]
         let install_result = {
-            let running_app_path = cx.update(|cx| cx.app_path())?;
-            let background_executor = cx.background_executor().clone();
-            let channel = cx.update(|cx| ReleaseChannel::global(cx).dev_name());
-            cx.background_spawn(Self::install_release(
-                installer_dir,
-                target_path.clone(),
-                running_app_path,
-                channel,
-                background_executor,
-            ))
-            .await
+            match cx.update(|cx| cx.app_path()) {
+                Ok(running_app_path) => {
+                    let channel = cx.update(|cx| ReleaseChannel::global(cx).dev_name());
+                    cx.background_spawn(Self::install_release(
+                        installer_dir,
+                        target_path.clone(),
+                        running_app_path,
+                        channel,
+                    ))
+                    .await
+                }
+                Err(error) => Err(error),
+            }
         };
-        let new_binary_path = install_result
-            .with_context(|| format!("Failed to install update at: {}", target_path.display()))?;
+        let new_binary_path = match install_result {
+            Ok(new_binary_path) => new_binary_path,
+            Err(error) => {
+                this.update(cx, |this, _| {
+                    this.failed_install_version = Some(newer_version.clone());
+                });
+                log::error!("auto-update installation of Rezed {newer_version} failed: {error:#}");
+                return Err(error).with_context(|| {
+                    format!("Failed to install update at: {}", target_path.display())
+                });
+            }
+        };
         if let Some(new_binary_path) = new_binary_path {
             cx.update(|cx| cx.set_restart_path(new_binary_path));
         }
 
         this.update(cx, |this, cx| {
+            this.failed_install_version = None;
             this.set_should_show_update_notification(true, cx)
                 .detach_and_log_err(cx);
             this.status = AutoUpdateStatus::Updated {
@@ -912,6 +941,11 @@ impl AutoUpdater {
             cx.notify();
         });
         Ok(())
+    }
+
+    fn should_skip_automatic_install_retry(&self, version: &Version) -> bool {
+        self.update_check_type == UpdateCheckType::Automatic
+            && self.failed_install_version.as_ref() == Some(version)
     }
 
     fn check_if_fetched_version_is_newer(
@@ -986,18 +1020,9 @@ impl AutoUpdater {
         target_path: PathBuf,
         running_app_path: PathBuf,
         channel: &str,
-        background_executor: BackgroundExecutor,
     ) -> Result<Option<PathBuf>> {
         match OS {
-            "macos" => {
-                install_release_macos(
-                    &installer_dir,
-                    &target_path,
-                    running_app_path,
-                    &background_executor,
-                )
-                .await
-            }
+            "macos" => install_release_macos(installer_dir, &target_path, running_app_path).await,
             "linux" => {
                 install_release_linux(&installer_dir, &target_path, channel, running_app_path).await
             }
@@ -1244,105 +1269,478 @@ async fn install_release_linux(
     Ok(Some(to.join(expected_suffix)))
 }
 
+#[cfg(target_os = "macos")]
+fn acquire_macos_update_lock() -> Result<std::fs::File> {
+    acquire_macos_update_lock_at(&env::temp_dir().join(UPDATE_LOCK_FILE))
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_macos_update_lock_at(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("failed to open Rezed update lock at {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!("another Rezed update is already in progress")
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).context("failed to acquire Rezed update lock")
+        }
+    }
+}
+
+const CANCELLED_MACOS_INSTALL_CLEANUP_SCRIPT: &str = concat!(
+    "for delay in 0 1 2; do ",
+    "/bin/sleep \"$delay\"; ",
+    "if /usr/bin/hdiutil detach -force \"$1\"; then /bin/rm -rf \"$2\"; exit 0; fi; ",
+    "done; ",
+    "if [ ! -e \"$1\" ]; then /bin/rm -rf \"$2\"; exit 0; fi; ",
+    "mount_device=$(/usr/bin/stat -f %d \"$1\" 2>/dev/null); ",
+    "installer_device=$(/usr/bin/stat -f %d \"$2\" 2>/dev/null); ",
+    "if [ -n \"$mount_device\" ] && [ \"$mount_device\" = \"$installer_device\" ]; then ",
+    "/bin/rm -rf \"$2\"; exit 0; fi; ",
+    "/usr/bin/logger -t Rezed \"failed to detach auto-update disk image at $1 during cancellation; retained $2 for startup recovery\"",
+);
+
+trait MacOsUpdateCommandRunner {
+    async fn attach(&self, downloaded_dmg: &Path, mount_path: &Path) -> Result<()>;
+    async fn copy_app(&self, mounted_app_path: &OsStr, running_app_path: &Path) -> Result<()>;
+    async fn detach(&self, mount_path: &Path) -> Result<()>;
+    fn detach_on_drop(&self, mount_path: &Path, installer_path: &Path) -> Result<()>;
+    fn is_mounted(&self, mount_path: &Path) -> bool;
+    async fn is_process_running(&self, process_id: u32) -> Result<bool>;
+}
+
+struct SystemMacOsUpdateCommandRunner;
+
+impl MacOsUpdateCommandRunner for SystemMacOsUpdateCommandRunner {
+    async fn attach(&self, downloaded_dmg: &Path, mount_path: &Path) -> Result<()> {
+        let mut command = new_command("hdiutil");
+        command
+            .args(["attach", "-nobrowse"])
+            .arg(downloaded_dmg)
+            .arg("-mountpoint")
+            .arg(mount_path)
+            .kill_on_drop(true);
+        let output = command
+            .output()
+            .await
+            .with_context(|| format!("failed to mount disk image with {command:?}"))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to mount disk image at {}: {}",
+            mount_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    async fn copy_app(&self, mounted_app_path: &OsStr, running_app_path: &Path) -> Result<()> {
+        let mut command = new_command("rsync");
+        command
+            .args(["-av", "--delete", "--exclude", "Icon?"])
+            .arg(mounted_app_path)
+            .arg(running_app_path)
+            .kill_on_drop(true);
+        let output = command
+            .output()
+            .await
+            .with_context(|| format!("failed to copy app with {command:?}"))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to copy app to {}: {}",
+            running_app_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    async fn detach(&self, mount_path: &Path) -> Result<()> {
+        let mut command = new_command("hdiutil");
+        command.args(["detach", "-force"]).arg(mount_path);
+        let output = command.output().await.with_context(|| {
+            format!("failed to run hdiutil detach for {}", mount_path.display())
+        })?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to detach disk image at {}: {}",
+            mount_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    fn detach_on_drop(&self, mount_path: &Path, installer_path: &Path) -> Result<()> {
+        // This child must outlive the app's executors so cancellation during
+        // shutdown still detaches the image before removing its temp dir.
+        let mut command = new_command("/bin/sh");
+        command
+            .args([
+                "-c",
+                CANCELLED_MACOS_INSTALL_CLEANUP_SCRIPT,
+                "rezed-auto-update-cleanup",
+            ])
+            .arg(mount_path)
+            .arg(installer_path)
+            .stdin(util::command::Stdio::null())
+            .stdout(util::command::Stdio::null())
+            .stderr(util::command::Stdio::null());
+        command.spawn().with_context(|| {
+            format!(
+                "failed to start detach and cleanup for {} during cancellation",
+                mount_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn is_mounted(&self, mount_path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let Some(parent_path) = mount_path.parent() else {
+                return false;
+            };
+            let Ok(mount_metadata) = std::fs::metadata(mount_path) else {
+                return false;
+            };
+            let Ok(parent_metadata) = std::fs::metadata(parent_path) else {
+                return false;
+            };
+            mount_metadata.dev() != parent_metadata.dev()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    async fn is_process_running(&self, process_id: u32) -> Result<bool> {
+        let process_id = process_id.to_string();
+        let output = new_command("/bin/ps")
+            .args(["-p", process_id.as_str(), "-o", "pid="])
+            .output()
+            .await
+            .context("failed to check Rezed updater process")?;
+        Ok(output.status.success() && !output.stdout.is_empty())
+    }
+}
+
+struct MountedMacOsInstaller<'a, CommandRunner: MacOsUpdateCommandRunner> {
+    _installer_dir: InstallerDir,
+    mount_path: PathBuf,
+    command_runner: &'a CommandRunner,
+    needs_detach: bool,
+}
+
+impl<'a, CommandRunner: MacOsUpdateCommandRunner> MountedMacOsInstaller<'a, CommandRunner> {
+    fn new(
+        installer_dir: InstallerDir,
+        mount_path: PathBuf,
+        command_runner: &'a CommandRunner,
+    ) -> Self {
+        Self {
+            _installer_dir: installer_dir,
+            mount_path,
+            command_runner,
+            needs_detach: true,
+        }
+    }
+
+    fn is_mounted(&self) -> bool {
+        self.command_runner.is_mounted(&self.mount_path)
+    }
+
+    fn disarm(&mut self) {
+        self.needs_detach = false;
+    }
+
+    async fn detach(mut self) -> Result<()> {
+        let detach_result = self.command_runner.detach(&self.mount_path).await;
+        if detach_result.is_ok() || !self.is_mounted() {
+            self.needs_detach = false;
+        }
+        detach_result?;
+        log::info!(
+            "detached auto-update disk image at {}",
+            self.mount_path.display()
+        );
+        Ok(())
+    }
+}
+
+impl<CommandRunner: MacOsUpdateCommandRunner> Drop for MountedMacOsInstaller<'_, CommandRunner> {
+    fn drop(&mut self) {
+        if !self.needs_detach {
+            return;
+        }
+        let installer_path = self._installer_dir.path().to_owned();
+        self._installer_dir.keep_for_external_cleanup();
+        match self
+            .command_runner
+            .detach_on_drop(&self.mount_path, &installer_path)
+        {
+            Ok(()) => log::info!(
+                "started detaching auto-update disk image at {} and cleaning {} during cancellation",
+                self.mount_path.display(),
+                installer_path.display()
+            ),
+            Err(error) => log::error!(
+                "failed to detach auto-update disk image at {} during cleanup: {error:#}",
+                self.mount_path.display()
+            ),
+        }
+    }
+}
+
 async fn install_release_macos(
-    temp_dir: &InstallerDir,
+    installer_dir: InstallerDir,
     downloaded_dmg: &Path,
     running_app_path: PathBuf,
-    background_executor: &BackgroundExecutor,
+) -> Result<Option<PathBuf>> {
+    install_release_macos_with_runner(
+        installer_dir,
+        downloaded_dmg,
+        running_app_path,
+        &SystemMacOsUpdateCommandRunner,
+    )
+    .await
+}
+
+async fn install_release_macos_with_runner<CommandRunner: MacOsUpdateCommandRunner>(
+    installer_dir: InstallerDir,
+    downloaded_dmg: &Path,
+    running_app_path: PathBuf,
+    command_runner: &CommandRunner,
 ) -> Result<Option<PathBuf>> {
     let running_app_filename = running_app_path
         .file_name()
         .with_context(|| format!("invalid running app path {running_app_path:?}"))?;
 
-    let mount_path = temp_dir.path().join("Zed");
+    let mount_path = installer_dir.path().join("mount");
     let mut mounted_app_path: OsString = mount_path.join(running_app_filename).into();
-
     mounted_app_path.push("/");
-    let mut cmd = new_command("hdiutil");
-    cmd.args(["attach", "-nobrowse"])
-        .arg(&downloaded_dmg)
-        .arg("-mountroot")
-        .arg(temp_dir.path());
-    let output = cmd
-        .output()
+    let mut mounted_installer =
+        MountedMacOsInstaller::new(installer_dir, mount_path, command_runner);
+
+    if let Err(error) = command_runner
+        .attach(downloaded_dmg, &mounted_installer.mount_path)
         .await
-        .with_context(|| "failed to mount: {cmd}")?;
+    {
+        if !mounted_installer.is_mounted() {
+            mounted_installer.disarm();
+            return Err(error);
+        }
+        return match mounted_installer.detach().await {
+            Ok(()) => Err(error),
+            Err(detach_error) => anyhow::bail!(
+                "failed to attach disk image: {error:#}; additionally failed to detach its partial mount: {detach_error:#}"
+            ),
+        };
+    }
 
-    anyhow::ensure!(
-        output.status.success(),
-        "failed to mount: {:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let copy_result = command_runner
+        .copy_app(&mounted_app_path, &running_app_path)
+        .await;
+    let detach_result = mounted_installer.detach().await;
 
-    let unmounter = MacOsUnmounter {
-        mount_path: mount_path.clone(),
-        background_executor,
-    };
-
-    let mut cmd = new_command("rsync");
-    cmd.args(["-av", "--delete", "--exclude", "Icon?"])
-        .arg(&mounted_app_path)
-        .arg(&running_app_path);
-    let rsync_output = cmd.output().await;
-
-    // Await the unmount (even if rsync failed) so that the installer temp dir
-    // can be deleted once this function returns.
-    unmounter.unmount().await;
-
-    let output = rsync_output.with_context(|| "failed to rsync: {cmd}")?;
-
-    anyhow::ensure!(
-        output.status.success(),
-        "failed to copy app: {:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    Ok(None)
+    match (copy_result, detach_result) {
+        (Ok(()), Ok(())) => Ok(None),
+        (Err(copy_error), Ok(())) => Err(copy_error),
+        (Ok(()), Err(detach_error)) => Err(detach_error),
+        (Err(copy_error), Err(detach_error)) => anyhow::bail!(
+            "failed to copy app: {copy_error:#}; additionally failed to detach disk image: {detach_error:#}"
+        ),
+    }
 }
 
-/// Removes stale installer dirs from the system temp dir. Older Zed versions
-/// leaked one per update by deleting the dir while the downloaded disk image
-/// was still mounted inside it, which made the deletion fail silently.
-#[cfg(any(rust_analyzer, all(not(target_os = "windows"), not(test))))]
-async fn cleanup_stale_installer_dirs() {
-    const STALE_INSTALLER_DIR_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-
-    let temp_dir = std::env::temp_dir();
-    let Ok(mut entries) = fs::read_dir(&temp_dir).await else {
-        log::warn!("failed to read temp dir {temp_dir:?} while cleaning up installer dirs");
-        return;
-    };
+#[cfg(target_os = "macos")]
+async fn cleanup_macos_stale_installer_dirs_in<CommandRunner: MacOsUpdateCommandRunner>(
+    temp_dir: &Path,
+    stale_before: SystemTime,
+    command_runner: &CommandRunner,
+) -> Result<bool> {
+    let mut entries = fs::read_dir(temp_dir).await?;
+    let mut cleanup_succeeded = true;
     while let Some(entry) = entries.next().await {
-        let Ok(entry) = entry else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                log::warn!("failed to read an installer dir entry: {error}");
+                continue;
+            }
         };
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(INSTALLER_DIR_PREFIX)
-        {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let is_directory = entry
+            .file_type()
+            .await
+            .ok()
+            .is_some_and(|file_type| file_type.is_dir());
+        if !is_directory {
             continue;
         }
-        // Leave recent dirs alone, as they may belong to an update currently
-        // in progress in another Zed instance.
-        let is_stale = entry.metadata().await.ok().is_some_and(|metadata| {
-            metadata.is_dir()
-                && metadata.modified().ok().is_some_and(|modified| {
-                    SystemTime::now()
-                        .duration_since(modified)
-                        .is_ok_and(|age| age > STALE_INSTALLER_DIR_AGE)
-                })
-        });
-        if is_stale {
-            if let Err(error) = fs::remove_dir_all(entry.path()).await {
-                log::warn!(
-                    "failed to remove stale installer dir {:?}: {error}",
-                    entry.path()
-                );
-            } else {
-                log::info!("removed stale installer dir {:?}", entry.path());
+
+        let marked_process_id = if file_name.starts_with(INSTALLER_DIR_PREFIX) {
+            fs::read(path.join(INSTALLER_MARKER_FILE))
+                .await
+                .ok()
+                .and_then(|contents| installer_marker_process_id(&contents))
+        } else {
+            None
+        };
+        if let Some(process_id) = marked_process_id {
+            match command_runner.is_process_running(process_id).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    cleanup_succeeded = false;
+                    log::warn!(
+                        "failed to determine whether Rezed updater process {process_id} still owns {}: {error:#}",
+                        path.display()
+                    );
+                    continue;
+                }
             }
         }
+        let legacy_mount_path = path.join("Rezed");
+        let is_legacy_rezed_dir = marked_process_id.is_none()
+            && file_name.starts_with(LEGACY_INSTALLER_DIR_PREFIX)
+            && entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .is_some_and(|modified| modified <= stale_before)
+            && std::fs::symlink_metadata(path.join("Zed.dmg"))
+                .is_ok_and(|metadata| metadata.is_file())
+            && std::fs::symlink_metadata(legacy_mount_path.join("Rezed.app"))
+                .is_ok_and(|metadata| metadata.is_dir())
+            && command_runner.is_mounted(&legacy_mount_path);
+
+        let mount_path = if marked_process_id.is_some() {
+            let mount_path = path.join("mount");
+            command_runner.is_mounted(&mount_path).then_some(mount_path)
+        } else if is_legacy_rezed_dir {
+            Some(legacy_mount_path)
+        } else {
+            continue;
+        };
+
+        if let Some(mount_path) = mount_path {
+            match command_runner.detach(&mount_path).await {
+                Ok(()) => log::info!(
+                    "detached stale Rezed updater mount at {}",
+                    mount_path.display()
+                ),
+                Err(error) if command_runner.is_mounted(&mount_path) => {
+                    cleanup_succeeded = false;
+                    log::error!(
+                        "failed to detach stale Rezed updater mount at {}: {error:#}",
+                        mount_path.display()
+                    );
+                    continue;
+                }
+                Err(error) => log::warn!(
+                    "detach reported an error for stale Rezed updater mount at {}, but it is no longer mounted: {error:#}",
+                    mount_path.display()
+                ),
+            }
+        }
+
+        if let Err(error) = fs::remove_dir_all(&path).await {
+            cleanup_succeeded = false;
+            log::warn!(
+                "failed to remove stale Rezed installer dir {}: {error}",
+                path.display()
+            );
+        } else {
+            log::info!("removed stale Rezed installer dir {}", path.display());
+        }
+    }
+    Ok(cleanup_succeeded)
+}
+
+#[cfg(target_os = "macos")]
+fn installer_marker_content(process_id: u32) -> String {
+    format!("{INSTALLER_MARKER_PREFIX}{process_id}\n")
+}
+
+#[cfg(target_os = "macos")]
+fn installer_marker_process_id(contents: &[u8]) -> Option<u32> {
+    std::str::from_utf8(contents)
+        .ok()?
+        .strip_prefix(INSTALLER_MARKER_PREFIX)?
+        .strip_suffix('\n')?
+        .parse()
+        .ok()
+}
+
+#[cfg(any(rust_analyzer, all(not(target_os = "windows"), not(test))))]
+async fn cleanup_stale_installer_dirs() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        const STALE_INSTALLER_DIR_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+        let stale_before = SystemTime::now()
+            .checked_sub(STALE_INSTALLER_DIR_AGE)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        match cleanup_macos_stale_installer_dirs_in(
+            &env::temp_dir(),
+            stale_before,
+            &SystemMacOsUpdateCommandRunner,
+        )
+        .await
+        {
+            Ok(true) => return true,
+            Ok(false) => {
+                log::warn!(
+                    "some Rezed installer artifacts could not be cleaned up; automatic updates will remain paused while cleanup is retried"
+                );
+                return false;
+            }
+            Err(error) => {
+                log::warn!("failed to clean up stale Rezed installer dirs: {error:#}");
+                return false;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        const STALE_INSTALLER_DIR_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+        let temp_dir = env::temp_dir();
+        let Ok(mut entries) = fs::read_dir(&temp_dir).await else {
+            log::warn!("failed to read temp dir {temp_dir:?} while cleaning up installer dirs");
+            return false;
+        };
+        while let Some(Ok(entry)) = entries.next().await {
+            let path = entry.path();
+            let is_stale_rezed_dir = entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(INSTALLER_DIR_PREFIX)
+                && entry.metadata().await.ok().is_some_and(|metadata| {
+                    metadata.is_dir()
+                        && metadata.modified().ok().is_some_and(|modified| {
+                            SystemTime::now()
+                                .duration_since(modified)
+                                .is_ok_and(|age| age > STALE_INSTALLER_DIR_AGE)
+                        })
+                });
+            if is_stale_rezed_dir {
+                if let Err(error) = fs::remove_dir_all(&path).await {
+                    log::warn!("failed to remove stale installer dir {path:?}: {error}");
+                }
+            }
+        }
+        true
     }
 }
 
@@ -1414,6 +1812,8 @@ mod tests {
     use gpui::TestAppContext;
     use http_client::{FakeHttpClient, Response};
     use settings::default_settings;
+    #[cfg(target_os = "macos")]
+    use std::collections::HashSet;
     use std::{
         rc::Rc,
         sync::{
@@ -1432,6 +1832,130 @@ mod tests {
 
     pub(super) struct InstallOverride(pub Rc<dyn Fn(&Path, &AsyncApp) -> Result<Option<PathBuf>>>);
     impl Global for InstallOverride {}
+
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, PartialEq)]
+    enum MacOsCommandCall {
+        Attach {
+            downloaded_dmg: PathBuf,
+            mount_path: PathBuf,
+        },
+        Copy {
+            mounted_app_path: OsString,
+            running_app_path: PathBuf,
+        },
+        Detach {
+            mount_path: PathBuf,
+        },
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Default)]
+    struct FakeMacOsUpdateCommandRunner {
+        calls: parking_lot::Mutex<Vec<MacOsCommandCall>>,
+        mounted_paths: parking_lot::Mutex<HashSet<PathBuf>>,
+        running_processes: parking_lot::Mutex<HashSet<u32>>,
+        fail_attach: AtomicBool,
+        fail_copy: AtomicBool,
+        fail_detach: AtomicBool,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl FakeMacOsUpdateCommandRunner {
+        fn mark_mounted(&self, mount_path: &Path) {
+            self.mounted_paths.lock().insert(mount_path.to_owned());
+        }
+
+        fn calls(&self) -> parking_lot::MutexGuard<'_, Vec<MacOsCommandCall>> {
+            self.calls.lock()
+        }
+
+        fn detach_impl(&self, mount_path: &Path) -> Result<()> {
+            self.calls.lock().push(MacOsCommandCall::Detach {
+                mount_path: mount_path.to_owned(),
+            });
+            anyhow::ensure!(
+                !self.fail_detach.load(atomic::Ordering::SeqCst),
+                "fake detach failure"
+            );
+            self.mounted_paths.lock().remove(mount_path);
+            match std::fs::remove_dir_all(mount_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl MacOsUpdateCommandRunner for FakeMacOsUpdateCommandRunner {
+        async fn attach(&self, downloaded_dmg: &Path, mount_path: &Path) -> Result<()> {
+            self.calls.lock().push(MacOsCommandCall::Attach {
+                downloaded_dmg: downloaded_dmg.to_owned(),
+                mount_path: mount_path.to_owned(),
+            });
+            std::fs::create_dir_all(mount_path.join("Rezed.app"))?;
+            self.mark_mounted(mount_path);
+            anyhow::ensure!(
+                !self.fail_attach.load(atomic::Ordering::SeqCst),
+                "fake attach failure"
+            );
+            Ok(())
+        }
+
+        async fn copy_app(&self, mounted_app_path: &OsStr, running_app_path: &Path) -> Result<()> {
+            self.calls.lock().push(MacOsCommandCall::Copy {
+                mounted_app_path: mounted_app_path.to_owned(),
+                running_app_path: running_app_path.to_owned(),
+            });
+            anyhow::ensure!(
+                !self.fail_copy.load(atomic::Ordering::SeqCst),
+                "fake copy failure"
+            );
+            Ok(())
+        }
+
+        async fn detach(&self, mount_path: &Path) -> Result<()> {
+            self.detach_impl(mount_path)
+        }
+
+        fn detach_on_drop(&self, mount_path: &Path, installer_path: &Path) -> Result<()> {
+            self.detach_impl(mount_path)?;
+            std::fs::remove_dir_all(installer_path)?;
+            Ok(())
+        }
+
+        fn is_mounted(&self, mount_path: &Path) -> bool {
+            self.mounted_paths.lock().contains(mount_path)
+        }
+
+        async fn is_process_running(&self, process_id: u32) -> Result<bool> {
+            Ok(self.running_processes.lock().contains(&process_id))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_installer_marker(path: &Path, process_id: u32) -> Result<()> {
+        std::fs::write(
+            path.join(INSTALLER_MARKER_FILE),
+            installer_marker_content(process_id),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_installer_dir(parent: &Path) -> Result<InstallerDir> {
+        let temp_dir = tempfile::Builder::new()
+            .prefix(INSTALLER_DIR_PREFIX)
+            .tempdir_in(parent)?;
+        let path = temp_dir.path().to_owned();
+        write_installer_marker(&path, std::process::id())?;
+        Ok(InstallerDir {
+            path,
+            temp_dir: Some(temp_dir),
+        })
+    }
 
     #[gpui::test]
     fn test_auto_update_defaults_to_true(cx: &mut TestAppContext) {
@@ -1504,9 +2028,31 @@ mod tests {
             assert_eq!(updater.current_version(), semver::Version::new(0, 100, 0));
         });
 
+        auto_updater.update(cx, |updater, cx| {
+            let failed_version = semver::Version::new(0, 100, 1);
+            updater.failed_install_version = Some(failed_version.clone());
+            updater.pending_poll = Some(Task::ready(None));
+            updater.poll(UpdateCheckType::Manual, cx);
+            assert!(!updater.should_skip_automatic_install_retry(&failed_version));
+            updater.pending_poll = None;
+            updater.failed_install_version = None;
+            updater.update_check_type = UpdateCheckType::Automatic;
+        });
+
         release_available.store(true, atomic::Ordering::SeqCst);
+        auto_updater.update(cx, |updater, _| {
+            updater.failed_install_version = Some(semver::Version::new(0, 100, 1));
+        });
         cx.background_executor.advance_clock(POLL_INTERVAL);
         cx.background_executor.run_until_parked();
+        assert_eq!(
+            auto_updater.read_with(cx, |updater, _| updater.status()),
+            AutoUpdateStatus::Idle
+        );
+
+        auto_updater.update(cx, |updater, cx| {
+            updater.poll(UpdateCheckType::Manual, cx);
+        });
 
         loop {
             cx.background_executor.timer(Duration::from_millis(0)).await;
@@ -1519,6 +2065,25 @@ mod tests {
         let status = auto_updater.read_with(cx, |updater, _| updater.status());
         assert_eq!(
             status,
+            AutoUpdateStatus::Downloading {
+                version: semver::Version::new(0, 100, 1),
+                progress: None,
+            }
+        );
+
+        auto_updater.update(cx, |updater, cx| {
+            updater.poll(UpdateCheckType::Automatic, cx);
+            updater.poll(UpdateCheckType::Manual, cx);
+        });
+        assert_eq!(
+            auto_updater.read_with(cx, |updater, _| updater.update_check_type()),
+            UpdateCheckType::Manual
+        );
+        assert!(!auto_updater.read_with(cx, |updater, _| {
+            updater.should_skip_automatic_install_retry(&semver::Version::new(0, 100, 1))
+        }));
+        assert_eq!(
+            auto_updater.read_with(cx, |updater, _| updater.status()),
             AutoUpdateStatus::Downloading {
                 version: semver::Version::new(0, 100, 1),
                 progress: None,
@@ -1559,6 +2124,381 @@ mod tests {
         let path = will_restart.await.unwrap().unwrap();
         assert_eq!(path, tmp_dir.path().join("zed"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "<fake-zed-update>");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_macos_install_uses_fixed_mountpoint_and_cleans_up(_cx: &mut TestAppContext) {
+        let installer_root = tempdir().unwrap();
+        let installer_dir = test_installer_dir(installer_root.path()).unwrap();
+        let downloaded_dmg = installer_dir.path().join("Zed.dmg");
+        std::fs::write(&downloaded_dmg, "fake dmg").unwrap();
+        let running_app_root = tempdir().unwrap();
+        let running_app_path = running_app_root.path().join("Rezed.app");
+        std::fs::create_dir(&running_app_path).unwrap();
+        let mount_path = installer_dir.path().join("mount");
+        let mut mounted_app_path: OsString = mount_path.join("Rezed.app").into();
+        mounted_app_path.push("/");
+        let command_runner = FakeMacOsUpdateCommandRunner::default();
+
+        install_release_macos_with_runner(
+            installer_dir,
+            &downloaded_dmg,
+            running_app_path.clone(),
+            &command_runner,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            command_runner.calls().as_slice(),
+            [
+                MacOsCommandCall::Attach {
+                    downloaded_dmg,
+                    mount_path: mount_path.clone(),
+                },
+                MacOsCommandCall::Copy {
+                    mounted_app_path,
+                    running_app_path,
+                },
+                MacOsCommandCall::Detach { mount_path },
+            ]
+        );
+        assert_eq!(std::fs::read_dir(installer_root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_macos_installer_dir_cleans_up_after_download_failure(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        let installer_root = tempdir().unwrap();
+        let installer_dir = test_installer_dir(installer_root.path()).unwrap();
+        let target_path = installer_dir.path().join("Zed.dmg");
+        let client = FakeHttpClient::create(|_| async move {
+            Ok(Response::builder()
+                .status(500)
+                .body("failed".into())
+                .unwrap())
+        });
+
+        let error = download_release(
+            &target_path,
+            ReleaseAsset {
+                version: "1.0.0".to_string(),
+                url: "https://test.example/download".to_string(),
+            },
+            client,
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("failed to download update"));
+
+        drop(installer_dir);
+        assert_eq!(std::fs::read_dir(installer_root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_update_lock_prevents_concurrent_attempts() {
+        let temp_root = tempdir().unwrap();
+        let lock_path = temp_root.path().join(UPDATE_LOCK_FILE);
+        let first_lock = acquire_macos_update_lock_at(&lock_path).unwrap();
+
+        let error = acquire_macos_update_lock_at(&lock_path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("another Rezed update is already in progress")
+        );
+
+        drop(first_lock);
+        acquire_macos_update_lock_at(&lock_path).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_macos_install_detaches_and_cleans_up_after_copy_failures(
+        _cx: &mut TestAppContext,
+    ) {
+        let installer_root = tempdir().unwrap();
+        let running_app_root = tempdir().unwrap();
+        let running_app_path = running_app_root.path().join("Rezed.app");
+        std::fs::create_dir(&running_app_path).unwrap();
+        let command_runner = FakeMacOsUpdateCommandRunner::default();
+        command_runner
+            .fail_copy
+            .store(true, atomic::Ordering::SeqCst);
+
+        for _ in 0..3 {
+            let installer_dir = test_installer_dir(installer_root.path()).unwrap();
+            let downloaded_dmg = installer_dir.path().join("Zed.dmg");
+            std::fs::write(&downloaded_dmg, "fake dmg").unwrap();
+
+            let error = install_release_macos_with_runner(
+                installer_dir,
+                &downloaded_dmg,
+                running_app_path.clone(),
+                &command_runner,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error.to_string().contains("fake copy failure"));
+            assert_eq!(std::fs::read_dir(installer_root.path()).unwrap().count(), 0);
+        }
+        assert_eq!(
+            command_runner
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, MacOsCommandCall::Detach { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_macos_install_detaches_partial_mount_after_attach_failure(
+        _cx: &mut TestAppContext,
+    ) {
+        let installer_root = tempdir().unwrap();
+        let installer_dir = test_installer_dir(installer_root.path()).unwrap();
+        let downloaded_dmg = installer_dir.path().join("Zed.dmg");
+        std::fs::write(&downloaded_dmg, "fake dmg").unwrap();
+        let running_app_path = tempdir().unwrap().path().join("Rezed.app");
+        let command_runner = FakeMacOsUpdateCommandRunner::default();
+        command_runner
+            .fail_attach
+            .store(true, atomic::Ordering::SeqCst);
+
+        let error = install_release_macos_with_runner(
+            installer_dir,
+            &downloaded_dmg,
+            running_app_path,
+            &command_runner,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("fake attach failure"));
+        assert!(
+            command_runner
+                .calls()
+                .iter()
+                .any(|call| matches!(call, MacOsCommandCall::Detach { .. }))
+        );
+        assert_eq!(std::fs::read_dir(installer_root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_macos_installer_detaches_when_cancelled(_cx: &mut TestAppContext) {
+        let installer_root = tempdir().unwrap();
+        let installer_dir = test_installer_dir(installer_root.path()).unwrap();
+        let downloaded_dmg = installer_dir.path().join("Zed.dmg");
+        std::fs::write(&downloaded_dmg, "fake dmg").unwrap();
+        let mount_path = installer_dir.path().join("mount");
+        let command_runner = FakeMacOsUpdateCommandRunner::default();
+        command_runner
+            .attach(&downloaded_dmg, &mount_path)
+            .await
+            .unwrap();
+
+        drop(MountedMacOsInstaller::new(
+            installer_dir,
+            mount_path.clone(),
+            &command_runner,
+        ));
+
+        assert!(
+            command_runner.calls().iter().any(
+                |call| matches!(call, MacOsCommandCall::Detach { mount_path: path } if path == &mount_path)
+            )
+        );
+        assert_eq!(std::fs::read_dir(installer_root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_stale_cleanup_only_removes_confirmed_rezed_installer_dirs(
+        cx: &mut TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        let temp_root = tempdir().unwrap();
+        let command_runner = FakeMacOsUpdateCommandRunner::default();
+
+        let marked_dir = temp_root.path().join("rezed-auto-update-marked");
+        let marked_mount = marked_dir.join("mount");
+        std::fs::create_dir_all(marked_mount.join("Rezed.app")).unwrap();
+        write_installer_marker(&marked_dir, 1000).unwrap();
+        command_runner.mark_mounted(&marked_mount);
+
+        let live_marked_dir = temp_root.path().join("rezed-auto-update-live");
+        let live_marked_mount = live_marked_dir.join("mount");
+        std::fs::create_dir_all(live_marked_mount.join("Rezed.app")).unwrap();
+        write_installer_marker(&live_marked_dir, 1001).unwrap();
+        command_runner.mark_mounted(&live_marked_mount);
+        command_runner.running_processes.lock().insert(1001);
+
+        let legacy_dir = temp_root.path().join("zed-auto-update-legacy");
+        let legacy_mount = legacy_dir.join("Rezed");
+        std::fs::create_dir_all(legacy_mount.join("Rezed.app")).unwrap();
+        std::fs::write(legacy_dir.join("Zed.dmg"), "fake dmg").unwrap();
+        command_runner.mark_mounted(&legacy_mount);
+
+        let unrelated_dir = temp_root.path().join("zed-auto-update-unrelated");
+        let unrelated_mount = unrelated_dir.join("Zed");
+        std::fs::create_dir_all(unrelated_mount.join("Zed.app")).unwrap();
+        std::fs::write(unrelated_dir.join("Zed.dmg"), "other app dmg").unwrap();
+        command_runner.mark_mounted(&unrelated_mount);
+
+        let invalid_marker_dir = temp_root.path().join("rezed-auto-update-invalid-marker");
+        let invalid_marker_mount = invalid_marker_dir.join("mount");
+        std::fs::create_dir_all(invalid_marker_mount.join("Rezed.app")).unwrap();
+        std::fs::write(
+            invalid_marker_dir.join(INSTALLER_MARKER_FILE),
+            "another updater",
+        )
+        .unwrap();
+        command_runner.mark_mounted(&invalid_marker_mount);
+
+        cleanup_macos_stale_installer_dirs_in(
+            temp_root.path(),
+            SystemTime::UNIX_EPOCH,
+            &command_runner,
+        )
+        .await
+        .unwrap();
+        assert!(!marked_dir.exists());
+        assert!(live_marked_dir.exists());
+        assert!(legacy_dir.exists());
+        assert_eq!(
+            command_runner.calls().as_slice(),
+            [MacOsCommandCall::Detach {
+                mount_path: marked_mount.clone()
+            }]
+        );
+
+        cleanup_macos_stale_installer_dirs_in(
+            temp_root.path(),
+            SystemTime::now()
+                .checked_add(Duration::from_secs(1))
+                .unwrap(),
+            &command_runner,
+        )
+        .await
+        .unwrap();
+
+        assert!(!marked_dir.exists());
+        assert!(live_marked_dir.exists());
+        assert!(!legacy_dir.exists());
+        assert!(unrelated_dir.exists());
+        assert!(invalid_marker_dir.exists());
+        assert_eq!(
+            command_runner
+                .calls()
+                .iter()
+                .filter_map(|call| match call {
+                    MacOsCommandCall::Detach { mount_path } => Some(mount_path.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>(),
+            HashSet::from([marked_mount, legacy_mount])
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_stale_cleanup_retains_mount_when_detach_fails(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        let temp_root = tempdir().unwrap();
+        let command_runner = FakeMacOsUpdateCommandRunner::default();
+        let marked_dir = temp_root.path().join("rezed-auto-update-marked");
+        let marked_mount = marked_dir.join("mount");
+        std::fs::create_dir_all(marked_mount.join("Rezed.app")).unwrap();
+        write_installer_marker(&marked_dir, 1000).unwrap();
+        command_runner.mark_mounted(&marked_mount);
+        command_runner
+            .fail_detach
+            .store(true, atomic::Ordering::SeqCst);
+
+        assert!(
+            !cleanup_macos_stale_installer_dirs_in(
+                temp_root.path(),
+                SystemTime::now(),
+                &command_runner
+            )
+            .await
+            .unwrap()
+        );
+        assert!(marked_dir.exists());
+
+        command_runner
+            .fail_detach
+            .store(false, atomic::Ordering::SeqCst);
+        assert!(
+            cleanup_macos_stale_installer_dirs_in(
+                temp_root.path(),
+                SystemTime::now(),
+                &command_runner
+            )
+            .await
+            .unwrap()
+        );
+        assert!(!marked_dir.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_macos_install_retains_mount_until_failed_detach_can_be_recovered(
+        cx: &mut TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        let installer_root = tempdir().unwrap();
+        let installer_dir = test_installer_dir(installer_root.path()).unwrap();
+        let installer_path = installer_dir.path().to_owned();
+        let downloaded_dmg = installer_path.join("Zed.dmg");
+        std::fs::write(&downloaded_dmg, "fake dmg").unwrap();
+        let running_app_path = tempdir().unwrap().path().join("Rezed.app");
+        let command_runner = FakeMacOsUpdateCommandRunner::default();
+        command_runner
+            .fail_detach
+            .store(true, atomic::Ordering::SeqCst);
+
+        let error = install_release_macos_with_runner(
+            installer_dir,
+            &downloaded_dmg,
+            running_app_path,
+            &command_runner,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("fake detach failure"));
+        assert!(installer_path.exists());
+        assert_eq!(
+            command_runner
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, MacOsCommandCall::Detach { .. }))
+                .count(),
+            2
+        );
+
+        command_runner
+            .fail_detach
+            .store(false, atomic::Ordering::SeqCst);
+        cleanup_macos_stale_installer_dirs_in(
+            installer_root.path(),
+            SystemTime::now()
+                .checked_add(Duration::from_secs(1))
+                .unwrap(),
+            &command_runner,
+        )
+        .await
+        .unwrap();
+        assert!(!installer_path.exists());
     }
 
     #[gpui::test]
