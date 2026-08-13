@@ -2,7 +2,7 @@
 description = "The fast, collaborative code editor fork."
 edition.workspace = true
 name = "zed"
-version = "1.13.2-rezed.1"
+version = "1.13.2-rezed.2"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Rezed Maintainers"]
